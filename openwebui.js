@@ -1,13 +1,15 @@
 // --- 配置区域 ---
 const TARGET_HOST = "libabaasdasd21312asda-web.hf.space"; // 您要代理的目标主机
-const TARGET_SCHEME = "https"; // 目标主机的协议 (http 或 https)
+const TARGET_SCHEME = "https"; // 目标主机的协议 (https)
 
-// --- 日志记录函数 (与Deno脚本类似) ---
+// --- 日志记录函数 ---
 function log(message) {
+  // 在 Cloudflare Workers 中，可以直接使用 console.log
+  // 如果需要更复杂的日志，可以考虑集成第三方日志服务
   console.log(`[${new Date().toISOString()}] ${message}`);
 }
 
-// --- User-Agent 生成函数 (源自Deno脚本) ---
+// --- User-Agent 生成函数 (源自您的 Deno 脚本) ---
 function getDefaultUserAgent(isMobile = false) {
   if (isMobile) {
     return "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
@@ -16,32 +18,32 @@ function getDefaultUserAgent(isMobile = false) {
   }
 }
 
-// --- 请求头转换函数 (适配Deno脚本逻辑，用于发往源服务器的请求) ---
-function transformHeadersForOrigin(requestHeaders, targetHost /* 通常是 TARGET_HOST */) {
-  const newHeaders = new Headers(requestHeaders); // 复制原始请求头
+// --- HTTP 请求头转换函数 (用于发往源服务器的 HTTP 请求) ---
+function transformHttpHeadersForOrigin(clientRequestHeaders, targetHostForHeader) {
+  const newHeaders = new Headers(clientRequestHeaders); // 复制原始请求头
 
   // 根据 sec-ch-ua-mobile 判断是否为移动设备并设置 User-Agent
   const isMobile = newHeaders.get("sec-ch-ua-mobile") === "?1";
   newHeaders.set("User-Agent", getDefaultUserAgent(isMobile));
 
-  // 设置 Host 和 Origin 头部
-  newHeaders.set("Host", targetHost);
-  newHeaders.set("Origin", `${TARGET_SCHEME}://${targetHost}`);
+  // 设置 Host 和 Origin 头部 (针对 HTTP 请求)
+  newHeaders.set("Host", targetHostForHeader);
+  newHeaders.set("Origin", `${TARGET_SCHEME}://${targetHostForHeader}`);
 
-  // 清理一些 Cloudflare 特有的、不应发送到源的头部 (可选)
+  // 清理一些 Cloudflare 特有的、不应发送到源的头部 (可选，但推荐)
   newHeaders.delete('cf-connecting-ip');
   newHeaders.delete('cf-ipcountry');
   newHeaders.delete('cf-ray');
   newHeaders.delete('cf-visitor');
+  newHeaders.delete('x-real-ip'); // 通常由CF的 CF-Connecting-IP 代替
   newHeaders.delete('cdn-loop');
-  // 根据需要添加或删除更多
 
   return newHeaders;
 }
 
 // --- Cloudflare Worker 入口 ---
 export default {
-  async fetch(request, env, ctx) {
+  async fetch(request /*: Request */, env /*: Env */, ctx /*: ExecutionContext */) /*: Promise<Response> */ {
     const originalUrl = new URL(request.url);
 
     // 判断是否为 WebSocket 升级请求
@@ -63,8 +65,8 @@ async function handleHttpRequest(request, originalUrl) {
 
   log(`HTTP Request: ${request.method} ${originalUrl.pathname}${originalUrl.search} -> ${targetUrl.toString()}`);
 
-  // 准备发往源服务器的请求头部
-  const originRequestHeaders = transformHeadersForOrigin(request.headers, TARGET_HOST);
+  // 准备发往源服务器的 HTTP 请求头部 (应用Deno脚本中的转换逻辑)
+  const originRequestHeaders = transformHttpHeadersForOrigin(request.headers, TARGET_HOST);
 
   try {
     const originResponse = await fetch(targetUrl.toString(), {
@@ -79,11 +81,17 @@ async function handleHttpRequest(request, originalUrl) {
 
     // 添加 Access-Control-Allow-Origin (与Deno脚本行为一致)
     responseHeaders.set("Access-Control-Allow-Origin", "*");
-    // 如果需要更细致的 CORS 控制，可以在这里根据 request.headers.get('Origin') 来设置
+    // 生产环境建议更严格的CORS策略
+    // responseHeaders.set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+    // responseHeaders.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
-    // 可选：添加其他安全相关的响应头
-    // responseHeaders.set('X-Content-Type-Options', 'nosniff');
-    // responseHeaders.set('X-Frame-Options', 'DENY');
+
+    // 确保 SSE 流相关的头部被正确处理 (通常是透传源服务器的)
+    // 如果源服务器的 SSE 响应没有 Cache-Control: no-cache 等，可以在这里补充
+    // if (responseHeaders.get('content-type')?.includes('text/event-stream')) {
+    //   responseHeaders.set('cache-control', 'no-cache');
+    //   responseHeaders.set('connection', 'keep-alive'); // 虽然通常由HTTP/1.1管理
+    // }
 
     return new Response(originResponse.body, {
       status: originResponse.status,
@@ -92,8 +100,8 @@ async function handleHttpRequest(request, originalUrl) {
     });
 
   } catch (error) {
-    log(`HTTP Proxy Error: ${error.message} for ${targetUrl.toString()}`);
-    return new Response(`Proxy Error: ${error.message}`, { status: 500 });
+    log(`HTTP Proxy Error: ${error.name} - ${error.message} for ${targetUrl.toString()}`);
+    return new Response(`Proxy Error: ${error.message}`, { status: 502 }); // Bad Gateway 更合适
   }
 }
 
@@ -106,39 +114,62 @@ async function handleWebSocket(request, originalUrl) {
   log(`WebSocket Upgrade: ${originalUrl.pathname}${originalUrl.search} -> ${targetWsUrl.toString()}`);
 
   const webSocketPair = new WebSocketPair();
-  const client = webSocketPair[0]; // 连接到客户端的 WebSocket
-  const server = webSocketPair[1]; // Worker 内部的 WebSocket，用于连接到源
+  const clientWs = webSocketPair[0]; // 连接到客户端浏览器的 WebSocket
+  const serverWs = webSocketPair[1]; // Worker 内部的 WebSocket，用于连接到源服务器
 
-  server.accept(); // 接受 Worker runtime 的连接
+  serverWs.accept(); // 接受来自 Worker runtime 的连接，这会触发 serverWs 的 open 事件
 
   // 准备发往源 WebSocket 服务器的头部
-  // Cloudflare Worker 的 fetch API 在请求 WebSocket 时，会自动处理一些头部，
-  // 但明确设置 Host 和其他必要的 Sec-WebSocket-* 头部是好习惯。
+  // **关键调整**：这里的头部尽量模拟原生 WebSocket 客户端的行为，
+  // 而不是完全照搬 HTTP 请求的 transformHttpHeadersForOrigin 逻辑。
   const originWsHeaders = new Headers();
-  originWsHeaders.set('Host', TARGET_HOST);
+  originWsHeaders.set('Host', TARGET_HOST); // 必须
   originWsHeaders.set('Upgrade', 'websocket'); // 必须
   // originWsHeaders.set('Connection', 'Upgrade'); // fetch 通常会自动处理
 
-  // 复制客户端的 Sec-WebSocket-* 头部
-  const clientSecKey = request.headers.get('Sec-WebSocket-Key');
-  if (clientSecKey) originWsHeaders.set('Sec-WebSocket-Key', clientSecKey);
+  // 1. 透传客户端的 User-Agent
+  if (request.headers.has('User-Agent')) {
+    originWsHeaders.set('User-Agent', request.headers.get('User-Agent'));
+  } else {
+    // 如果客户端没有 User-Agent (不太可能来自浏览器)，可以设置一个通用的，
+    // 或者 Deno 可能的默认 User-Agent (例如 "Deno/x.y.z")，
+    // 但通常透传客户端的更合理。这里我们不设，依赖fetch的默认行为或上面透传的。
+  }
 
-  const clientSecVersion = request.headers.get('Sec-WebSocket-Version');
-  if (clientSecVersion) originWsHeaders.set('Sec-WebSocket-Version', clientSecVersion);
+  // 2. 透传 Sec-WebSocket-* 头部
+  const secWebSocketKey = request.headers.get('Sec-WebSocket-Key');
+  if (secWebSocketKey) originWsHeaders.set('Sec-WebSocket-Key', secWebSocketKey);
+
+  const secWebSocketVersion = request.headers.get('Sec-WebSocket-Version');
+  if (secWebSocketVersion) originWsHeaders.set('Sec-WebSocket-Version', secWebSocketVersion);
 
   const clientSecProtocol = request.headers.get('Sec-WebSocket-Protocol');
   if (clientSecProtocol) originWsHeaders.set('Sec-WebSocket-Protocol', clientSecProtocol);
 
-  // 应用 User-Agent 和 Origin (与Deno脚本行为一致)
-  const isMobile = request.headers.get("sec-ch-ua-mobile") === "?1";
-  originWsHeaders.set("User-Agent", getDefaultUserAgent(isMobile));
-  originWsHeaders.set("Origin", `${TARGET_SCHEME}://${TARGET_HOST}`);
+  // 3. Origin 头部处理 (更接近原生WebSocket客户端行为)
+  //    原生 WebSocket 客户端通常会发送发起请求页面的 Origin。
+  //    如果客户端请求 Worker 时带了 Origin，我们就透传它。
+  //    如果没带 (例如非浏览器客户端)，Deno 的 `new WebSocket()` 可能不发送 Origin，或发送 null/本地路径。
+  //    这里我们选择：如果客户端有 Origin 就透传，没有就不主动为 WebSocket 设置伪造的 Origin，
+  //    除非测试发现目标服务器强制要求一个与 TARGET_HOST 匹配的 Origin。
+  if (request.headers.has('Origin')) {
+    originWsHeaders.set('Origin', request.headers.get('Origin'));
+  } else {
+    // 备选方案：如果目标服务器强依赖一个 Origin，即使客户端没传，
+    // Deno 的 HTTP 代理是成功的，它为 HTTP 设置了 Origin。
+    // 可以尝试为 WS 也设置，但这可能与 Deno 原生 WS 行为不同。
+    // 为求与 HTTP 行为一致性，且基于 Deno HTTP 代理成功的经验，先加上：
+    // log('Original request had no Origin for WebSocket, setting to target origin');
+    // originWsHeaders.set("Origin", `${TARGET_SCHEME}://${TARGET_HOST}`);
+    // **或者，为了更模拟 Deno 原生 WebSocket，这里不设置 Origin (如果原始请求没有的话)**
+    // **我们先尝试不设置，如果失败，再尝试上面被注释掉的强制设置**
+  }
 
 
   try {
-    // 使用 fetch 连接到源 WebSocket 服务器
     const originWsResponse = await fetch(targetWsUrl.toString(), {
       headers: originWsHeaders,
+      // 对于 WebSocket 的 fetch，不需要指定 method 或 body
     });
 
     const originSocket = originWsResponse.webSocket;
@@ -146,53 +177,39 @@ async function handleWebSocket(request, originalUrl) {
       log(`WebSocket origin did not upgrade. Status: ${originWsResponse.status}`);
       let errorBody = `WebSocket origin did not upgrade. Status: ${originWsResponse.status}`;
       try { errorBody += " Body: " + await originWsResponse.text(); } catch (e) {}
-      // 如果源服务器没有升级，我们不能用 server.close() 因为它期望一个已建立的连接。
-      // 直接返回错误响应给客户端。
       return new Response(errorBody, { status: originWsResponse.status, headers: originWsResponse.headers });
     }
 
-    originSocket.accept(); // 接受来自源服务器的 WebSocket 连接
+    originSocket.accept();
 
-    // 在 client (连接到浏览器) 和 originSocket (连接到目标服务器) 之间双向传递消息
+    // 双向绑定消息、关闭、错误事件
     originSocket.addEventListener('message', event => {
       try {
-        if (server.readyState === WebSocket.OPEN) { // 确保 server 端还开着
-          server.send(event.data);
-        }
-      } catch (e) {
-        log(`Error sending origin WS message to client: ${e.message || e}`);
-      }
+        if (serverWs.readyState === WebSocket.OPEN) serverWs.send(event.data);
+      } catch (e) { log(`Error serverWs.send: ${e}`); }
     });
-
-    server.addEventListener('message', event => {
+    serverWs.addEventListener('message', event => {
       try {
-        if (originSocket.readyState === WebSocket.OPEN) { // 确保 originSocket 还开着
-          originSocket.send(event.data);
-        }
-      } catch (e) {
-        log(`Error sending client WS message to origin: ${e.message || e}`);
-      }
+        if (originSocket.readyState === WebSocket.OPEN) originSocket.send(event.data);
+      } catch (e) { log(`Error originSocket.send: ${e}`); }
     });
 
-    // 处理关闭和错误事件，确保连接被正确清理
-    const closeOrErrorHandler = (wsSide, otherWs, event, type) => {
-      const code = event.code || 1000;
+    const commonCloseOrErrorHandler = (wsSide, otherWs, event, type) => {
+      const code = event.code || (type === 'error' ? 1011 : 1000); // 1011 server error, 1000 normal
       const reason = event.reason || (type === 'error' ? 'Error encountered' : 'Connection closed');
-      log(`${wsSide} WebSocket ${type}: Code ${code}, Reason: ${reason}`);
-      // 如果另一端还开着，就用相同的代码和原因关闭它
+      log(`${wsSide} WebSocket ${type}: Code ${code}, Reason: '${reason}'`);
       if (otherWs.readyState === WebSocket.OPEN || otherWs.readyState === WebSocket.CONNECTING) {
         otherWs.close(code, reason);
       }
     };
 
-    originSocket.addEventListener('close', event => closeOrErrorHandler('Origin', server, event, 'close'));
-    server.addEventListener('close', event => closeOrErrorHandler('Client', originSocket, event, 'close'));
-    originSocket.addEventListener('error', event => closeOrErrorHandler('Origin', server, event, 'error'));
-    server.addEventListener('error', event => closeOrErrorHandler('Client', originSocket, event, 'error'));
+    originSocket.addEventListener('close', event => commonCloseOrErrorHandler('Origin', serverWs, event, 'close'));
+    serverWs.addEventListener('close', event => commonCloseOrErrorHandler('Client', originSocket, event, 'close'));
+    originSocket.addEventListener('error', event => commonCloseOrErrorHandler('Origin', serverWs, event, 'error'));
+    serverWs.addEventListener('error', event => commonCloseOrErrorHandler('Client', originSocket, event, 'error'));
 
-    // 准备给客户端的 101 Switching Protocols 响应
+    // 准备并返回给客户端的 101 响应
     const responseHeaders = new Headers();
-    // 如果源服务器选择了子协议，将其传回给客户端
     const chosenProtocol = originWsResponse.headers.get('sec-websocket-protocol');
     if (chosenProtocol) {
       responseHeaders.set('sec-websocket-protocol', chosenProtocol);
@@ -200,16 +217,16 @@ async function handleWebSocket(request, originalUrl) {
 
     return new Response(null, {
       status: 101,
-      webSocket: client, // 将 client 端 WebSocket 交给 Cloudflare runtime
+      webSocket: clientWs, // 将 clientWs 交给 runtime
       headers: responseHeaders,
     });
 
   } catch (error) {
-    log(`WebSocket connection to origin error: ${error.message || error}`);
-    // 如果在 fetch 阶段就出错了，server 可能还没完全建立，但尝试关闭
-    if (server && server.readyState !== WebSocket.CLOSED && server.readyState !== WebSocket.CLOSING) {
-        server.close(1011, `Proxy to origin failed: ${error.message || error}`);
+    log(`WebSocket connection to origin error: ${error.name} - ${error.message}`);
+    if (serverWs && serverWs.readyState !== WebSocket.CLOSED && serverWs.readyState !== WebSocket.CLOSING) {
+        serverWs.close(1011, `Proxy to origin failed: ${error.message}`);
     }
-    return new Response(`WebSocket Proxy Error: ${error.message || error}`, { status: 502 }); // Bad Gateway
+    return new Response(`WebSocket Proxy Error: ${error.message}`, { status: 502 });
   }
 }
+
