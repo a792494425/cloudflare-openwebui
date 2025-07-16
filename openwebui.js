@@ -1,146 +1,184 @@
-// --- 配置 ---
-// 建议在Cloudflare的环境变量中设置这些值。
-// const TARGET_HOST = "libabaasdasd21312asda-web.hf.space"; // 例如：在Cloudflare仪表板中设置为 TARGET_HOST
-// const TARGET_SCHEME = "https"; // 例如：在Cloudflare仪表板中设置为 TARGET_SCHEME
+/**
+ * @typedef {Object} Env
+ * @property {string} TARGET_HOST - 目标服务器的主机名 (例如: "your-app.hf.space")
+ * @property {string} TARGET_SCHEME - 目标服务器的协议 (例如: "https")
+ * @property {string} ALLOWED_ORIGIN - [推荐] 允许跨域请求的前端域名 (例如: "https://your-frontend.com")
+ */
 
 export default {
+  /**
+   * @param {Request} request
+   * @param {Env} env
+   * @param {ExecutionContext} ctx
+   * @returns {Promise<Response>}
+   */
   async fetch(request, env, ctx) {
-    // 从环境变量读取配置值 (提供备用值)
-    const TARGET_HOST = env.TARGET_HOST || "libabaasdasd21312asda-web.hf.space";
-    const TARGET_SCHEME = env.TARGET_SCHEME || "https";
-
-    const url = new URL(request.url);
-
-    // 构建目标URL
-    const targetUrlObj = new URL(`${TARGET_SCHEME}://${TARGET_HOST}`);
-    targetUrlObj.pathname = url.pathname;
-    targetUrlObj.search = url.search;
-    const targetRequestUrl = targetUrlObj.toString();
-
-    // 准备发往源服务器的请求头：主要修改Host头部，其他透传
-    const originRequestHeaders = new Headers(request.headers);
-    originRequestHeaders.set('Host', TARGET_HOST);
-
-    // 删除Cloudflare添加的、不应发往源服务器的头部
-    originRequestHeaders.delete('cf-connecting-ip');
-    originRequestHeaders.delete('cf-ipcountry');
-    originRequestHeaders.delete('cf-ray');
-    originRequestHeaders.delete('cf-visitor');
-    originRequestHeaders.delete('x-real-ip'); // 通常由 cf-connecting-ip 替代
-
-    // 处理 WebSocket 升级请求
-    if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
-      const webSocketPair = new WebSocketPair();
-      const clientWs = webSocketPair[0];
-      const serverWs = webSocketPair[1];
-
-      serverWs.accept();
-
-      // WebSocket 握手头部：设置 Host，透传关键的 Sec-* 头部和客户端原始的 UA/Origin
-      const wsHandshakeHeaders = new Headers();
-      wsHandshakeHeaders.set('Host', TARGET_HOST);
-      wsHandshakeHeaders.set('Upgrade', 'websocket');
-      wsHandshakeHeaders.set('Connection', 'Upgrade'); // 某些源服务器可能需要此头部
-
-      if (request.headers.has('Sec-WebSocket-Key')) wsHandshakeHeaders.set('Sec-WebSocket-Key', request.headers.get('Sec-WebSocket-Key'));
-      if (request.headers.has('Sec-WebSocket-Version')) wsHandshakeHeaders.set('Sec-WebSocket-Version', request.headers.get('Sec-WebSocket-Version'));
-      if (request.headers.has('Sec-WebSocket-Protocol')) wsHandshakeHeaders.set('Sec-WebSocket-Protocol', request.headers.get('Sec-WebSocket-Protocol'));
-
-      // 透传原始客户端的 User-Agent 和 Origin (如果存在)
-      if (request.headers.has('User-Agent')) wsHandshakeHeaders.set('User-Agent', request.headers.get('User-Agent'));
-      if (request.headers.has('Origin')) {
-        wsHandshakeHeaders.set('Origin', request.headers.get('Origin'));
-      } else {
-        // 如果客户端没有发送 Origin (例如非浏览器客户端),
-        // 且 hf.space 强制要求 Origin，可以考虑取消下面一行的注释，
-        // 并使用 TARGET_SCHEME 和 TARGET_HOST 生成 Origin。
-        // wsHandshakeHeaders.set('Origin', `${TARGET_SCHEME}://${TARGET_HOST}`);
-        // console.log(`WebSocket：来自 ${request.headers.get('cf-connecting-ip')} 的原始请求没有 Origin 头部。目标：${targetRequestUrl}`);
+    try {
+      // 优先从环境变量中读取配置，如果未设置则使用默认值
+      // 强烈建议在 Cloudflare 的设置中配置这些环境变量
+      const TARGET_HOST = env.TARGET_HOST || "libabaasdasd21312asda-web.hf.space";
+      const TARGET_SCHEME = env.TARGET_SCHEME || "https";
+      
+      // 处理 WebSocket 升级请求
+      if (request.headers.get('Upgrade')?.toLowerCase() === 'websocket') {
+        return this.handleWebSocketRequest(request, TARGET_HOST, TARGET_SCHEME);
       }
-
-      try {
-        // 向源服务器发起 WebSocket 连接
-        const originResponse = await fetch(targetRequestUrl, { headers: wsHandshakeHeaders });
-        const originSocket = originResponse.webSocket;
-
-        if (!originSocket) {
-          // console.error(`WebSocket：源服务器未升级连接。状态码：${originResponse.status}，URL：${targetRequestUrl}`);
-          serverWs.close(1011, "源服务器未升级到 WebSocket"); // "Origin did not upgrade to WebSocket"
-          return new Response("WebSocket 源服务器未升级", { status: originResponse.status, headers: originResponse.headers }); // "WebSocket origin did not upgrade"
-        }
-        originSocket.accept();
-
-        // 消息、关闭、错误处理的双向绑定
-        originSocket.addEventListener('message', event => {
-          if (serverWs.readyState === WebSocket.OPEN) {
-            serverWs.send(event.data);
-          }
-        });
-        serverWs.addEventListener('message', event => {
-          if (originSocket.readyState === WebSocket.OPEN) {
-            originSocket.send(event.data);
-          }
-        });
-
-        const commonCloseHandler = (event, side) => {
-          // 生产环境中，考虑更详细的日志记录或与外部监控系统集成
-          // console.log(`${side} WebSocket 已关闭：${event.code} ${event.reason}。IP：${request.headers.get('cf-connecting-ip')}`);
-          if (side === 'origin' && serverWs.readyState === WebSocket.OPEN) serverWs.close(event.code, event.reason);
-          if (side === 'client' && originSocket.readyState === WebSocket.OPEN) originSocket.close(event.code, event.reason);
-        };
-        const commonErrorHandler = (event, side) => {
-          // 生产环境中，考虑更详细的日志记录或与外部监控系统集成
-          // console.error(`${side} WebSocket 错误：${event.message || '未知错误'}。IP：${request.headers.get('cf-connecting-ip')}`);
-          if (side === 'origin' && serverWs.readyState === WebSocket.OPEN) serverWs.close(1011, "源 WebSocket 错误"); // "Origin WebSocket error"
-          if (side === 'client' && originSocket.readyState === WebSocket.OPEN) originSocket.close(1011, "客户端 WebSocket 错误"); // "Client WebSocket error"
-        };
-
-        originSocket.addEventListener('close', event => commonCloseHandler(event, 'origin'));
-        serverWs.addEventListener('close', event => commonCloseHandler(event, 'client'));
-        originSocket.addEventListener('error', event => commonErrorHandler(event, 'origin'));
-        serverWs.addEventListener('error', event => commonErrorHandler(event, 'client'));
-
-        const responseHeaders = new Headers();
-        // 如果源服务器返回了 Sec-WebSocket-Protocol，则将其返回给客户端
-        if (originResponse.headers.has('sec-websocket-protocol')) {
-            responseHeaders.set('sec-websocket-protocol', originResponse.headers.get('sec-websocket-protocol'));
-        }
-
-        return new Response(null, { status: 101, webSocket: clientWs, headers: responseHeaders });
-
-      } catch (e) {
-        // console.error(`WebSocket 代理连接错误：${e.message}。IP：${request.headers.get('cf-connecting-ip')}，目标：${targetRequestUrl}`);
-        serverWs.close(1011, "WebSocket 代理连接错误"); // "WebSocket proxy connection error"
-        return new Response(`WebSocket 代理错误：${e.message}`, { status: 502 }); // "WebSocket Proxy Error: "
-      }
-    } else {
+      
       // 处理普通 HTTP 请求
-      try {
-        const response = await fetch(targetRequestUrl, {
-          method: request.method,
-          headers: originRequestHeaders,
-          body: request.body,
-          redirect: 'follow', // 与 Deno 脚本保持一致
-        });
+      return this.handleHttpRequest(request, TARGET_HOST, TARGET_SCHEME, env.ALLOWED_ORIGIN);
 
-        // 对响应头做最小修改，主要是透传，根据需要添加基础CORS
-        const responseHeaders = new Headers(response.headers);
-        // Access-Control-Allow-Origin 设置为 '*'，但根据安全需求，
-        // 可以考虑限制为特定的源。
-        responseHeaders.set('Access-Control-Allow-Origin', '*');
-        responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH'); // 根据需要调整方法
-        responseHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Authorization'); // 根据需要调整头部
+    } catch (e) {
+      console.error(`[Worker] 全局错误: ${e.message}`);
+      return new Response(`代理时发生内部错误: ${e.message}`, { status: 502 });
+    }
+  },
 
-        // 不添加强制缓存，不删除CSP等安全头部
+  /**
+   * 处理 HTTP 请求
+   * @param {Request} request 原始请求
+   * @param {string} targetHost 目标主机
+   * @param {string} targetScheme 目标协议
+   * @param {string | undefined} allowedOrigin 允许的跨域来源
+   * @returns {Promise<Response>}
+   */
+  async handleHttpRequest(request, targetHost, targetScheme, allowedOrigin) {
+    const url = new URL(request.url);
+    const targetUrl = `${targetScheme}://${targetHost}${url.pathname}${url.search}`;
 
-        return new Response(response.body, {
-          status: response.status,
-          headers: responseHeaders,
-        });
-      } catch (e) {
-        // console.error(`HTTP Fetch 错误：${e.message}。IP：${request.headers.get('cf-connecting-ip')}，目标：${targetRequestUrl}，方法：${request.method}`);
-        return new Response(`HTTP 代理错误：${e.message}`, {status: 502}); // "HTTP Proxy Error: "
+    // 复制请求头，并进行必要修改
+    const requestHeaders = new Headers(request.headers);
+    requestHeaders.set('Host', targetHost);
+    requestHeaders.set('X-Forwarded-Host', url.hostname);
+
+    // 将客户端的真实 IP 地址通过 X-Forwarded-For 传递给源服务器
+    const clientIp = request.headers.get('cf-connecting-ip');
+    if (clientIp) {
+      requestHeaders.set('X-Forwarded-For', clientIp);
+    }
+
+    // 删除 Cloudflare 特有的、不应转发到源站的头部
+    requestHeaders.delete('cf-connecting-ip');
+    requestHeaders.delete('cf-ipcountry');
+    requestHeaders.delete('cf-ray');
+    requestHeaders.delete('cf-visitor');
+
+    try {
+      const originResponse = await fetch(targetUrl, {
+        method: request.method,
+        headers: requestHeaders,
+        body: request.body,
+        redirect: 'manual', // 手动处理重定向，防止敏感信息泄露
+      });
+
+      // 对响应头进行修改
+      const responseHeaders = new Headers(originResponse.headers);
+
+      // --- CORS 头部设置 ---
+      // 为了安全，建议将 ALLOWED_ORIGIN 设置为你的前端域名，而不是 '*'
+      responseHeaders.set('Access-Control-Allow-Origin', allowedOrigin || new URL(request.url).origin);
+      responseHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
+      responseHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+      responseHeaders.set('Access-Control-Allow-Credentials', 'true');
+
+      // 不主动删除源服务器设置的 CSP 等安全头部
+
+      return new Response(originResponse.body, {
+        status: originResponse.status,
+        statusText: originResponse.statusText,
+        headers: responseHeaders,
+      });
+
+    } catch (e) {
+      console.error(`[HTTP] 请求目标失败: ${e.message}, URL: ${targetUrl}`);
+      return new Response(`HTTP 代理错误: ${e.message}`, { status: 502 });
+    }
+  },
+
+  /**
+   * 处理 WebSocket 握手和代理
+   * @param {Request} request 原始请求
+   * @param {string} targetHost 目标主机
+   * @param {string} targetScheme 目标协议
+   * @returns {Promise<Response>}
+   */
+  async handleWebSocketRequest(request, targetHost, targetScheme) {
+    const url = new URL(request.url);
+    const targetUrl = `${targetScheme === 'https' ? 'wss' : 'ws'}://${targetHost}${url.pathname}${url.search}`;
+
+    // 建立 WebSocket 连接对
+    const { 0: clientWs, 1: serverWs } = new WebSocketPair();
+
+    // 准备发往源服务器的 WebSocket 握手请求头
+    const handshakeHeaders = new Headers();
+    handshakeHeaders.set('Host', targetHost);
+    handshakeHeaders.set('Upgrade', 'websocket');
+    handshakeHeaders.set('Connection', 'Upgrade');
+
+    // 透传关键的 WebSocket 头部
+    const wsKeys = ['Sec-WebSocket-Key', 'Sec-WebSocket-Version', 'Sec-WebSocket-Protocol', 'User-Agent'];
+    wsKeys.forEach(key => {
+      if (request.headers.has(key)) {
+        handshakeHeaders.set(key, request.headers.get(key));
       }
+    });
+
+    // hf.space 等平台可能强制要求 Origin 头部
+    if (request.headers.has('Origin')) {
+      handshakeHeaders.set('Origin', request.headers.get('Origin'));
+    } else {
+      // 如果客户端未提供 Origin，则根据目标信息构造一个
+      handshakeHeaders.set('Origin', `${targetScheme}://${targetHost}`);
+    }
+
+    try {
+      // 向源服务器发起 WebSocket 连接请求
+      const originResponse = await fetch(targetUrl, { headers: handshakeHeaders });
+
+      const originSocket = originResponse.webSocket;
+      if (!originSocket) {
+        console.error(`[WebSocket] 源服务器未升级连接. 状态: ${originResponse.status}, URL: ${targetUrl}`);
+        return new Response("WebSocket 源服务器连接失败", { status: originResponse.status, headers: originResponse.headers });
+      }
+
+      // 接受双向连接，并设置事件监听以转发数据
+      serverWs.accept();
+      originSocket.accept();
+
+      const forwardMessage = (source, destination, direction) => {
+        source.addEventListener('message', event => {
+          if (destination.readyState === WebSocket.OPEN) {
+            destination.send(event.data);
+          }
+        });
+      };
+      
+      forwardMessage(serverWs, originSocket, 'client -> origin');
+      forwardMessage(originSocket, serverWs, 'origin -> client');
+
+      // 处理关闭和错误事件
+      const closeHandler = (event, side) => {
+        console.log(`[WebSocket] ${side} 已关闭: ${event.code} ${event.reason}`);
+        if (serverWs.readyState === WebSocket.OPEN) serverWs.close(event.code, event.reason);
+        if (originSocket.readyState === WebSocket.OPEN) originSocket.close(event.code, event.reason);
+      };
+
+      const errorHandler = (error, side) => {
+        console.error(`[WebSocket] ${side} 发生错误:`, error);
+        if (serverWs.readyState === WebSocket.OPEN) serverWs.close(1011, `${side} 错误`);
+        if (originSocket.readyState === WebSocket.OPEN) originSocket.close(1011, `${side} 错误`);
+      };
+
+      serverWs.addEventListener('close', event => closeHandler(event, '客户端'));
+      originSocket.addEventListener('close', event => closeHandler(event, '源服务器'));
+      serverWs.addEventListener('error', event => errorHandler(event, '客户端'));
+      originSocket.addEventListener('error', event => errorHandler(event, '源服务器'));
+      
+      // 返回 101 Switching Protocols 响应，并将客户端的 WebSocket 连接交由 Worker 处理
+      return new Response(null, { status: 101, webSocket: clientWs });
+
+    } catch (e) {
+      console.error(`[WebSocket] 代理连接错误: ${e.message}, URL: ${targetUrl}`);
+      return new Response(`WebSocket 代理错误: ${e.message}`, { status: 502 });
     }
   }
 };
